@@ -93,8 +93,12 @@ MAX_TOTAL_TRADE_USD = 1000.0
 # Each individual leg's entry value (shares × ask) must STRICTLY exceed this.
 MIN_LEG_VALUE_USD = 1.0
 
-# Exit triggers when the basket gains at least EXIT_MIN_EDGE_USD per share OR
-# EXIT_MIN_EDGE_PCT relative to the entry sum-of-asks, whichever is met first.
+# Exit triggers when ``sum(best_bid per leg) - entry_total_per_share`` is at
+# least EXIT_MIN_EDGE_USD. The exit fills against bids (you cross the spread
+# to sell out of the basket), so this measures the realized surplus over
+# the entry cost basis. EXIT_MIN_EDGE_PCT is retained for diagnostics only —
+# ``evaluate_exit`` reports it in ``edge_improvement_pct`` but no longer
+# uses it as a trigger.
 EXIT_MIN_EDGE_USD = 0.01
 EXIT_MIN_EDGE_PCT = 0.01
 
@@ -563,68 +567,69 @@ def evaluate_exit(
 
     Inputs:
         position       — an open Position
-        current_books  — token_id → (best_ask, available_size) or None for empty book
+        current_books  — token_id → (best_bid, bid_size) or None for empty bid side
+
+    A taker selling out of a basket position crosses the spread and hits
+    bids, so the exit must be evaluated against bid prices and bid sizes
+    (not asks). The trigger is purely on the SUM of best bids — there is
+    no per-leg gate. A single leg's bid rising sharply is enough to fire
+    the exit as long as the basket's total bid surplus crosses
+    ``EXIT_MIN_EDGE_USD``.
 
     Exit conditions (all must hold):
-    1. Every leg has a current best ask STRICTLY above its entry ask. If any
-       leg has retraced, the basket has lost edge and we don't unwind.
-    2. The bottleneck of currently available shares allows at least
-       ``ENTRY_BOTTLENECK_OFFSET + 1`` to be sold (so we can exit OFFSET-2 deep).
-    3. The total per-share edge improvement vs entry is ≥ ``EXIT_MIN_EDGE_USD``
-       OR ≥ ``EXIT_MIN_EDGE_PCT`` of the entry sum-of-asks (whichever first).
+    1. Every leg has a non-empty bid side (someone is willing to buy at
+       any price).
+    2. The bottleneck of bid sizes allows at least
+       ``ENTRY_BOTTLENECK_OFFSET + 1`` shares to be sold.
+    3. ``sum(best_bid per leg) ≥ entry_total_per_share + EXIT_MIN_EDGE_USD``
+       — i.e. the basket can be unwound for at least 1¢ more per share
+       than it was opened at.
 
     Returns ``(should_exit, reason, details)``. When ``should_exit`` is True
-    the ``details`` dict carries the exit_shares, current per-leg asks, total
-    proceeds, and edge-improvement metrics needed to actually close.
+    the ``details`` dict carries the exit_shares, current per-leg bids,
+    total proceeds, and edge-improvement metrics needed to actually close.
     """
-    current_asks: list[float] = []
+    current_bids: list[float] = []
     current_sizes: list[float] = []
     for leg in position.legs:
         info = current_books.get(leg.token_id)
         if info is None:
-            return False, f"no liquidity on leg {leg.title!r}", {}
-        ask, size = info
-        if ask <= leg.entry_price:
-            return (
-                False,
-                f"leg {leg.title!r} ask {ask:.4f} not above entry {leg.entry_price:.4f}",
-                {},
-            )
-        current_asks.append(ask)
+            return False, f"no bids on leg {leg.title!r}", {}
+        bid, size = info
+        current_bids.append(bid)
         current_sizes.append(size)
 
     exit_shares = max(0.0, min(current_sizes) - ENTRY_BOTTLENECK_OFFSET)
     if exit_shares <= 0:
         return (
             False,
-            f"current bottleneck too thin to exit (min size {min(current_sizes):.2f})",
+            f"bid bottleneck too thin to exit (min size {min(current_sizes):.2f})",
             {},
         )
     # Cap exit at the size of the held position — never sell more than we own.
     actual_exit_shares = min(exit_shares, position.shares)
 
-    current_total = sum(current_asks)
+    current_total = sum(current_bids)
     edge_improvement = current_total - position.entry_total_per_share
     edge_pct = (
         edge_improvement / position.entry_total_per_share
         if position.entry_total_per_share > 0
         else 0.0
     )
-    if edge_improvement < EXIT_MIN_EDGE_USD and edge_pct < EXIT_MIN_EDGE_PCT:
+    if edge_improvement < EXIT_MIN_EDGE_USD:
         return (
             False,
-            f"edge improvement ${edge_improvement:.4f} ({edge_pct * 100:.2f}%) "
-            f"below threshold (≥ ${EXIT_MIN_EDGE_USD:.2f} or "
-            f"≥ {EXIT_MIN_EDGE_PCT * 100:.0f}%)",
+            f"bid surplus ${edge_improvement:.4f} per share "
+            f"below threshold (≥ ${EXIT_MIN_EDGE_USD:.2f})",
             {},
         )
 
     return (
         True,
-        f"edge improvement ${edge_improvement:.4f} per share ({edge_pct * 100:.2f}%)",
+        f"bid surplus ${edge_improvement:.4f} per share ({edge_pct * 100:.2f}%)",
         {
             "exit_shares": actual_exit_shares,
-            "current_asks": current_asks,
+            "current_bids": current_bids,
             "current_total_per_share": current_total,
             "exit_total_usd": actual_exit_shares * current_total,
             "edge_improvement_per_share": edge_improvement,
@@ -634,15 +639,18 @@ def evaluate_exit(
 
 
 def close_position(position: Position, details: dict) -> Position:
-    """Mark ``position`` as closed using the metrics produced by ``evaluate_exit``."""
+    """Mark ``position`` as closed using the metrics produced by ``evaluate_exit``.
+
+    ``exit_price`` on each leg is the best bid we sold into.
+    """
     position.status = "closed"
     position.closed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     position.exit_shares = float(details["exit_shares"])
     position.exit_total_per_share = float(details["current_total_per_share"])
     position.exit_total_usd = float(details["exit_total_usd"])
     position.exit_legs = [
-        {"title": leg.title, "token_id": leg.token_id, "exit_price": ask}
-        for leg, ask in zip(position.legs, details["current_asks"])
+        {"title": leg.title, "token_id": leg.token_id, "exit_price": bid}
+        for leg, bid in zip(position.legs, details["current_bids"])
     ]
     position.edge_improvement_per_share = float(details["edge_improvement_per_share"])
     position.edge_improvement_pct = float(details["edge_improvement_pct"])
@@ -1114,6 +1122,55 @@ def extract_candidates(
 # ── CLOB order book queries ───────────────────────────────────────────────────
 
 
+def fetch_best_bids(
+    token_ids: list[str],
+) -> dict[str, Optional[tuple[float, float]]]:
+    """
+    Batch-query the CLOB POST /books endpoint for the best bid per YES token.
+    Returns {token_id -> (best_bid_price, bid_size)} or None if no bid side.
+
+    Bids are returned sorted descending (highest price first), so the
+    best bid is the maximum. We confirm with ``max(..., key=price)``
+    defensively in case of API ordering inconsistencies.
+    """
+    results: dict[str, Optional[tuple[float, float]]] = {}
+    total_batches = (len(token_ids) + CLOB_BATCH_SIZE - 1) // CLOB_BATCH_SIZE
+
+    with tqdm(
+        total=len(token_ids),
+        desc="Querying bids",
+        unit=" tokens",
+        dynamic_ncols=True,
+    ) as pbar:
+        for i in range(0, len(token_ids), CLOB_BATCH_SIZE):
+            chunk = token_ids[i : i + CLOB_BATCH_SIZE]
+            batch_num = i // CLOB_BATCH_SIZE + 1
+            pbar.set_postfix(batch=f"{batch_num}/{total_batches}", refresh=False)
+
+            data = _post(f"{CLOB_API}/books", [{"token_id": t} for t in chunk])
+
+            if not data:
+                for t in chunk:
+                    results[t] = None
+                pbar.update(len(chunk))
+                continue
+
+            books = data if isinstance(data, list) else [data]
+            for book in books:
+                tid = str(book.get("asset_id") or book.get("token_id") or "")
+                bids = book.get("bids") or []
+                if bids:
+                    best = max(bids, key=lambda b: float(b["price"]))
+                    results[tid] = (float(best["price"]), float(best["size"]))
+                else:
+                    results[tid] = None
+
+            pbar.update(len(chunk))
+            time.sleep(REQUEST_DELAY)
+
+    return results
+
+
 def fetch_best_asks(
     token_ids: list[str],
 ) -> dict[str, Optional[tuple[float, float]]]:
@@ -1483,7 +1540,7 @@ def cmd_check_exits(positions_path: Path) -> int:
         f"\nChecking exit conditions for {len(open_pos)} open position(s) "
         f"({len(all_tokens)} legs)…"
     )
-    books = fetch_best_asks(all_tokens)
+    books = fetch_best_bids(all_tokens)
 
     bar = "─" * 66
     print(bar)
@@ -1513,7 +1570,7 @@ def cmd_exit(slug: str, positions_path: Path) -> int:
         return 1
 
     token_ids = [leg.token_id for leg in target.legs]
-    books = fetch_best_asks(token_ids)
+    books = fetch_best_bids(token_ids)
     should_exit, reason, details = evaluate_exit(target, books)
 
     if not should_exit:
@@ -1545,8 +1602,8 @@ def cmd_exit(slug: str, positions_path: Path) -> int:
 # Entry/exit rules are NOT redefined here — they are reused verbatim:
 #   * Entry  → ``Opportunity.entry_check`` and ``Opportunity.entry_shares``
 #              (≤ 98% sum-of-asks, leg > $1, total ≤ $1000, bottleneck − 2 sh).
-#   * Exit   → ``evaluate_exit`` (every leg's ask above entry,
-#              bottleneck − 2 sh, edge ≥ $0.01/sh or ≥ 1%).
+#   * Exit   → ``evaluate_exit`` (sum of best bids across legs ≥ entry
+#              sum + $0.01/sh, bid bottleneck − 2 sh).
 
 DEFAULT_PAPER_TOP_N = 1  # rank window: only the top-ranked opportunity (rank #1)
 DEFAULT_PAPER_POLL_INTERVAL = 2.0  # seconds between order-book polls
@@ -1575,12 +1632,16 @@ class BookQuote:
 
 @dataclass
 class PaperFill:
-    """A single partial-exit fill against a PaperTrade."""
+    """A single partial-exit fill against a PaperTrade.
+
+    ``current_bids`` are the best bid prices we sold into on each leg at
+    the moment of the fill; ``sum_bids`` is their total per share.
+    """
 
     timestamp: float
     exit_shares: float
-    current_asks: list[float]
-    sum_asks: float
+    current_bids: list[float]
+    sum_bids: float
     edge_improvement_per_share: float
     edge_improvement_pct: float
 
@@ -1681,19 +1742,19 @@ def open_paper_trade(rank: int, trade_id: int, opp: Opportunity) -> PaperTrade:
     )
 
 
-def _books_to_ask_map(
+def _books_to_bid_map(
     legs: list[PositionLeg], books: Mapping[str, BookQuote]
 ) -> dict[str, Optional[tuple[float, float]]]:
-    """Project full ladders down to the (best_ask, best_ask_size) form that
-    ``evaluate_exit`` expects."""
-    ask_map: dict[str, Optional[tuple[float, float]]] = {}
+    """Project full ladders down to the (best_bid, best_bid_size) form that
+    ``evaluate_exit`` expects. A leg with no bid side maps to None."""
+    bid_map: dict[str, Optional[tuple[float, float]]] = {}
     for leg in legs:
         quote = books.get(leg.token_id)
-        if quote is None or quote.best_ask is None or quote.best_ask_size is None:
-            ask_map[leg.token_id] = None
+        if quote is None or quote.best_bid is None or not quote.bids:
+            bid_map[leg.token_id] = None
         else:
-            ask_map[leg.token_id] = (quote.best_ask, quote.best_ask_size)
-    return ask_map
+            bid_map[leg.token_id] = (quote.best_bid, quote.bids[0][1])
+    return bid_map
 
 
 def evaluate_paper_exit(
@@ -1706,7 +1767,7 @@ def evaluate_paper_exit(
     """
     if trade.closed:
         return False, "trade already fully exited", {}
-    ask_map = _books_to_ask_map(trade.position.legs, books)
+    bid_map = _books_to_bid_map(trade.position.legs, books)
     scratch = Position(
         event_slug=trade.position.event_slug,
         event_title=trade.position.event_title,
@@ -1717,7 +1778,7 @@ def evaluate_paper_exit(
         entry_total_per_share=trade.position.entry_total_per_share,
         entry_total_usd=trade.position.entry_total_usd,
     )
-    return evaluate_exit(scratch, ask_map)
+    return evaluate_exit(scratch, bid_map)
 
 
 def apply_paper_exit(trade: PaperTrade, details: dict) -> PaperFill:
@@ -1725,8 +1786,8 @@ def apply_paper_exit(trade: PaperTrade, details: dict) -> PaperFill:
     fill = PaperFill(
         timestamp=time.time(),
         exit_shares=float(details["exit_shares"]),
-        current_asks=list(details["current_asks"]),
-        sum_asks=float(details["current_total_per_share"]),
+        current_bids=list(details["current_bids"]),
+        sum_bids=float(details["current_total_per_share"]),
         edge_improvement_per_share=float(details["edge_improvement_per_share"]),
         edge_improvement_pct=float(details["edge_improvement_pct"]),
     )
@@ -1772,14 +1833,14 @@ def print_paper_orderbook(
         quote = books.get(leg.token_id) or BookQuote(bids=[], asks=[])
         asks_str = _fmt_ladder(quote.asks, depth)
         bids_str = _fmt_ladder(quote.bids, depth)
-        gate_ask = (
+        gate_bid = (
             "↑"
-            if (quote.best_ask is not None and quote.best_ask > leg.entry_price)
+            if (quote.best_bid is not None and quote.best_bid > leg.entry_price)
             else "·"
         )
         print(
             f"    {leg.title[:label_w]:<{label_w}}  "
-            f"entry=${leg.entry_price:.4f} {gate_ask}  "
+            f"entry=${leg.entry_price:.4f} {gate_bid}  "
             f"ASKS [{asks_str}]  BIDS [{bids_str}]"
         )
 
@@ -1813,8 +1874,8 @@ def _exit_event(trade: PaperTrade, fill: PaperFill) -> dict:
         "event_slug": trade.position.event_slug,
         "event_title": trade.position.event_title,
         "exit_shares": fill.exit_shares,
-        "current_asks": list(fill.current_asks),
-        "sum_asks": fill.sum_asks,
+        "current_bids": list(fill.current_bids),
+        "sum_bids": fill.sum_bids,
         "edge_improvement_per_share": fill.edge_improvement_per_share,
         "edge_improvement_pct": fill.edge_improvement_pct,
         "remaining_shares": trade.remaining_shares,
@@ -1914,7 +1975,7 @@ def run_paper_trading(
                     append_paper_trade_event(_exit_event(trade, fill), trades_log_path)
                 print(
                     f"    >>> EXIT FILL: sold {fill.exit_shares:,.0f} sh "
-                    f"@ sum_asks=${fill.sum_asks:.4f}  "
+                    f"@ sum_bids=${fill.sum_bids:.4f}  "
                     f"edge=+${fill.edge_improvement_per_share:.4f}/sh "
                     f"({fill.edge_improvement_pct * 100:.2f}%)  "
                     f"remaining={trade.remaining_shares:,.0f} sh"
@@ -1932,7 +1993,7 @@ def run_paper_trading(
         status = "CLOSED" if t.closed else "OPEN"
         sold = t.position.shares - t.remaining_shares
         avg_exit = (
-            sum(f.exit_shares * f.sum_asks for f in t.fills) / sold if sold > 0 else 0.0
+            sum(f.exit_shares * f.sum_bids for f in t.fills) / sold if sold > 0 else 0.0
         )
         edge = avg_exit - t.position.entry_total_per_share if sold > 0 else 0.0
         print(
