@@ -1,0 +1,28 @@
+[
+  {
+    "type": "entry",
+    "timestamp": "2026-05-13T01:15:10+00:00",
+    "trade_id": 1,
+    "rank": 1,
+    "event_slug": "me-01-house-election-winner",
+    "event_title": "ME-01 House Election Winner",
+    "event_url": "https://polymarket.com/event/me-01-house-election-winner",
+    "shares": 1000.98,
+    "entry_total_per_share": 0.98,
+    "entry_total_usd": 980.9604,
+    "legs": [
+      {
+        "title": "Democratic Party",
+        "token_id": "94554639500757758987279812351319440300426884282052362965373660288333724036844",
+        "entry_price": 0.92,
+        "fee_rate": 0.04
+      },
+      {
+        "title": "Republican Party",
+        "token_id": "5761277993320552538152777602315950813357240379370502081302196557887772568218",
+        "entry_price": 0.06,
+        "fee_rate": 0.04
+      }
+    ]
+  }
+]
